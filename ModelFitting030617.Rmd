@@ -1,6 +1,4 @@
-A Bayesian geostatistical approach to modelling     
-global distributions of *Lygodium microphyllum*     
-under projected climate warming     
+A Bayesian geostatistical approach to modelling global distributions of *Lygodium microphyllum* under projected climate warming    
 ==================================================
      
 Authors:
