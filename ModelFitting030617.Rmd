@@ -1,0 +1,496 @@
+A Bayesian geostatistical approach to modelling     
+global distributions of *Lygodium microphyllum*     
+under projected climate warming     
+==================================================
+     
+Authors:
+--------
+John M. Humphreys (jmh09r@my.fsu.edu)    
+James B. Elsner   
+Thomas H. Jagger  
+Stephanie Pau   
+     
+    
+The below script and linked data are sufficient to specify and fit the full model from the above cited paper.  Be advised, run time for the model may take several hours.     
+    
+An extended and executed version of this script (with all models/figures) can be viewed here:    
+http://rpubs.com/JMHumphreys/LygPA020217              
+   
+  
+```{r}
+date()
+```
+
+####Options   
+```{r}
+library(knitr)
+library(rgl)
+opts_knit$set(verbose = FALSE)
+knit_hooks$set(webgl = hook_webgl)
+```
+      
+###Load Packages:
+```{r}
+suppressMessages(library(INLA))
+#suppressMessages(library(rgdal))
+#suppressMessages(library(reshape2))
+suppressMessages(library(raster))
+#suppressMessages(library(fields))
+suppressMessages(library(rasterVis))
+suppressMessages(library(rgeos))
+suppressMessages(library(Thermimage))
+suppressMessages(library(maptools))
+suppressMessages(library(mapproj))
+#suppressMessages(library(spdep))
+suppressMessages(library(ggplot2))
+#suppressMessages(library(GISTools))
+suppressMessages(library(lattice))
+suppressMessages(library(gridExtra))
+suppressMessages(library(dplyr))
+```
+
+
+###Get Project Data
+The link provided below will download all of the data needed to run this script.  The text file includes the coordinates for species occurrences and qudrature as well as all covariates.  Descriptions of the data fields are provided below.  
+    
+     
+Data and copies of the R-Markdown files are available at:https://github.com/JMHumphreys/SDM_Lygodium    
+
+To view extended versions of the executed code, visit:  https://rpubs.com/JMHumphreys/LygPA020217     
+```{r}
+LygPA.df = read.csv("https://github.com/JMHumphreys/SDM_Lygodium/blob/master/LygodiumData.csv?raw=true",
+             stringsAsFactors = FALSE)
+
+dim(LygPA.df)
+head(LygPA.df)
+```
+    
+###Dataframe to spatialpoints   
+The resulting spatialpointsdataframe will be projected to 3D Cartesian coordinates below.  
+```{r}
+LL84 = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+LL = cbind(LygPA.df$Long, LygPA.df$Lat)
+LygPA = SpatialPointsDataFrame(LL, LygPA.df)
+proj4string(LygPA) = LL84
+```
+   
+   
+###Get Country Boundaries     
+```{r}
+Countries = map("world", 
+                fill = TRUE, 
+                plot = FALSE)
+
+
+IDs = sapply(strsplit(Countries$names, ":"), function(x) x[1])
+
+LL84 = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+CountriesP = map2SpatialPolygons(Countries, IDs = IDs,
+                                proj4string = CRS(projection(LL84 )))
+
+#Add a dataframe      
+pid = sapply(slot(CountriesP, "polygons"), 
+             function(x) slot(x, "ID"))
+
+p.df = data.frame( ID=1:length(CountriesP), 
+                   row.names = pid)
+
+Countries = SpatialPolygonsDataFrame(CountriesP, p.df)
+
+
+#Rasterized version for later plotting     
+Ras = raster(res = 0.9,
+             crs = proj4string(Countries))
+
+Domain.r = rasterize(Countries, Ras, 
+                     field = 0, 
+                     background = NA)
+
+```
+
+###Locations of Observations in 2D   
+```{r}
+LygC = subset(LygPA, OBS == 1) #Species observations
+
+Cp = levelplot(Domain.r, 
+               margin = FALSE,
+               xlab = NULL, ylab = NULL, 
+               col.regions = "tan",
+               colorkey = NULL, 
+                     panel = panel.levelplot, space = "right", 
+                     par.strip.text = list(fontface='bold'),
+                     par.settings = list(axis.line = list(col = "black"), 
+                                              strip.background = list(col = 'transparent'), 
+                                              strip.border = list(col = 'transparent')), 
+                                              scales = list(col = "black", cex = 1, relation="free")) + 
+              latticeExtra::layer(sp.polygons(Countries, col = "black", lwd = 1)) +
+              latticeExtra::layer(sp.polygons(LygC, col = "red", pch=19, cex=0.5))
+
+Cp
+```
+    
+    
+###Construct a mesh for the global domain ("mesh1")   
+The mesh is constructed to have a greater number of triangulation over terrestrial regions.   
+```{r warning = FALSE, webgl=TRUE}
+CountriesU = gBuffer(Countries, width = 1) #Smoothing edges
+
+MaxEdge = 2.0
+
+bdry = inla.sp2segment(CountriesU)
+
+mesh2D = inla.mesh.2d(boundary = bdry, 
+                     cutoff = 1, 
+                     max.edge = MaxEdge,
+                     min.angle = 21) 
+
+MeshLocs = cbind(mesh2D$loc[,1], mesh2D$loc[,2]) #Locations of mesh nodes
+
+#Converting to 3D coordinates
+xyz = as.data.frame(                
+          inla.mesh.map(MeshLocs, 
+                        projection = "longlat", 
+                        inverse = TRUE))
+
+true.radius.of.earth = 6371
+radius.of.earth = 1
+
+mesh1 = inla.mesh.create(loc = xyz,
+                         cutoff = 400/true.radius.of.earth, 
+                         refine=list(max.edge = 3500/true.radius.of.earth, min.angle = 26))
+
+mesh1$n
+plot(mesh1, rgl = TRUE, main = " ")
+```
+
+   
+   
+###Convert to Cartesian Coordinates
+Specify the "spde" spatial effect.  Converting the 2D long-lat coordinates from the observation and quadrature locations to 3D Cartesian coordinates (xyz) and then associating them to the mesh.  Also creating a spatial index ("field0").              
+```{r}
+spde = inla.spde2.pcmatern(mesh1,
+                           prior.range=c(0.9, 0.9),  
+                           prior.sigma=c(1, 0.01))
+
+locs = cbind(LygPA$Long, LygPA$Lat)
+
+locs = inla.mesh.map(locs, 
+                     projection = "longlat", 
+                     inverse = TRUE)
+
+
+A = inla.spde.make.A(mesh1, loc=locs) #project point locations to mesh
+
+field0 = inla.spde.make.index("field0", 
+                                  spde$n.spde) #spatial index
+```
+     
+
+###Construct Data Stack  
+Data stacks are used to put all fixed and random variables into a more easily managed object.  Although not used in this script, the variables "mTcm70" and "Pwq70" included with "LygPA" dataset contain projected temperature and precipitation data for the year 2070 as described in the publication.      
+```{r}
+FE.df = LygPA@data
+
+
+FE.lst = list(c(field0,                     #Spatial Index
+                list(intercept0 = 1)),      #Intercept
+                list(mTcm = FE.df[,"mTcm"], #Min Temp of Coldest Month
+                     Pwq = FE.df[,"Pwq"],   #Precipitation of Wettest Quarter
+                     Pop = FE.df[,"Pop"],   #Human Population density
+                     CTI = FE.df[,"CTI"],   #Compound Topographic Index
+                     NN = FE.df[,"NN"],     #Distance to nearest plant occurrence
+                     CoH = FE.df[,"CoH"]))  #Invasive Cohort Richness
+                  
+
+#Stack0 for model fitting
+Stack0 = inla.stack(data = list(OBS = FE.df$OBS), #Response.  Presence (1) or Quadrature (0)  
+                                  A = list(A, 1), #Intersection of points with mesh    
+                            effects = FE.lst,     #Index, Intercept, and Covariates  
+                                tag = "obs0")     #Just a label 
+```
+
+           
+###Modify SPDE Model  
+Before adding covariates to the model, the "spde" specification is modified.  The "extraconstr" control directs the SPDE spatial effect to a "design matrix" that holds the covariates and intercept; this helps reduce confounding by ensuring that the spatial effect is orthogonal to the covariates.  A "PC" Prior is specified based on the mesh parameters.   
+```{r}
+n.data = dim(LygPA@data)[1]
+n.covariates = 7
+
+X = cbind(rep(1,n.data), 
+        FE.df$mTcm,
+        FE.df$Pwq,
+        FE.df$Pop,
+        FE.df$CTI,
+        FE.df$NN,
+        FE.df$CoH)
+
+Q = qr.Q(qr(X))
+
+
+spde = inla.spde2.pcmatern(mesh1,
+                           prior.range=c(0.9, 0.9),
+                           prior.sigma=c(1, 0.01),  
+                           extraconstr = list(A = as.matrix(t(Q)%*%A), 
+                                              e = rep(0, n.covariates)))  
+```
+   
+###Full Model (Model5)
+```{r}
+pcprior1 = list(prec = list(prior="pc.prec", param = c(3, 0.01))) 
+pcprior2 = list(prec = list(prior="pc.prec", param = c(0.1, 0.01)))
+
+#theta5 = Model5$internal.summary.hyperpar$mean
+theta5 = c(-0.89178665, -0.06363225, -0.32293059, -0.64617359) #thetas from prior run
+
+Frm5 = OBS ~ -1 + intercept0 + 
+                  f(field0, model=spde) +
+                  f(mTcm, model = "rw1",  
+                    hyper = pcprior1,
+                    scale.model = TRUE) + 
+                  f(NN, model = "rw1",  
+                    hyper = pcprior2,
+                    scale.model = TRUE) + 
+                 Pop + CTI + Pwq + CoH          
+
+
+Model5 = inla(Frm5, 
+               data = inla.stack.data(Stack0, spde=spde), 
+               family = "binomial", 
+               verbose = TRUE,
+               control.fixed = list(prec = 0.1, prec.intercept = 0.1),    
+               control.predictor = list(
+                                      A = inla.stack.A(Stack0), 
+                                      compute = TRUE, 
+                                      link = 1), 
+               control.mode = list(restart = TRUE, theta = theta5),
+               control.results = list(return.marginals.random = TRUE,
+                                      return.marginals.predictor = TRUE),
+               control.compute=list(dic = TRUE, cpo = TRUE, waic = TRUE)) 
+```
+```{r}
+summary(Model5) 
+```
+   
+             
+###Random Effects  
+```{r}
+proj = inla.mesh.projector(mesh1, 
+                           dims=c(400, 800))
+
+plotdata = inla.mesh.project(proj, Model5$summary.random$field0[,"mean"])
+
+R600 = raster(nrows = 400, ncols = 800)
+
+values(R600) = plotdata
+
+M600 = as.matrix(R600)
+
+M0.spm = rotate90.matrix(M600) #rotation before rasterization
+M0.spmr = raster(M0.spm)
+extent(M0.spmr) = c(-180, 180, -90, 90)
+proj4string(M0.spmr) = CRS(proj4string(Domain.r))
+
+
+rng = seq(-4, 13, 0.01)
+cr = colorRampPalette(c("darkblue", "blue", "lightblue",
+                        "yellow", "orange", "red", "darkred"),  
+                        bias = 1.5, space = "rgb")
+
+Cp = levelplot(M0.spmr, 
+               margin = FALSE,
+               xlab = NULL, ylab = NULL, 
+               col.regions = cr, at = rng,
+               colorkey = list(at=seq(-5, 13, 0.01), 
+                     labels=list(at=c(-4, 0, 4, 8, 12)), 
+                     labels=c("-4", "0", "4", "8", "12")), 
+                     panel = panel.levelplot, space = "right", par.strip.text = list(fontface='bold'),
+                     col = cr, par.settings = list(axis.line = list(col = "black"), 
+                                              strip.background = list(col = 'transparent'), 
+                                              strip.border = list(col = 'transparent')), 
+                                              scales = list(col = "black", cex = 1))
+Cp + 
+  latticeExtra::layer(sp.polygons(Countries, col = "black", lwd = 1))
+```
+
+
+###Standard Deviation    
+```{r}
+plotdata = inla.mesh.project(proj, Model5$summary.random$field0[,"sd"])
+
+R600 = raster(nrows = 400, ncols = 800)
+
+values(R600) = plotdata
+
+M600 = as.matrix(R600)
+
+M0.spm = rotate90.matrix(M600) #rotation before rasterization
+M0.spmr = raster(M0.spm)
+extent(M0.spmr) = c(-180, 180, -90, 90)
+proj4string(M0.spmr) = CRS(proj4string(Domain.r))
+
+rng = seq(0, 4.4, 0.01)
+cr = colorRampPalette(c("lightblue", "yellow", "darkred"),  
+                        space = "rgb")
+
+Cp = levelplot(M0.spmr, 
+               margin = FALSE,
+               xlab = NULL, ylab = NULL, 
+               col.regions = cr, at = rng,
+               colorkey = list(at=seq(0, 4.4, 0.01), 
+                     labels=list(at=c(0, 1, 2, 3, 4)), 
+                     labels=c("0", "1", "2", "3", "4")), 
+                     panel = panel.levelplot, space = "right", par.strip.text = list(fontface='bold'),
+                     col = cr, par.settings = list(axis.line = list(col = "black"), 
+                                              strip.background = list(col = 'transparent'), 
+                                              strip.border = list(col = 'transparent')), 
+                                              scales = list(col = "black", cex = 1))
+Cp + 
+  latticeExtra::layer(sp.polygons(Countries, col = "black", lwd = 1))
+```
+
+
+###Temperature Limitation   
+Reduced survival in cold temperatures.     
+```{r}
+mic.df = as.data.frame(Model5$summary.random$mTcm[,1:6])
+names(mic.df) = c("ID", "Mean", "sd", "Q025", "Q50", "Q975")
+
+ggplot(mic.df, aes(ID*10, Mean)) +
+        geom_smooth(col = "black", 
+                  linetype= "solid",
+                  method = "loess",
+                  span = 0.25,
+                  se = FALSE,
+                  lwd = 1) +
+        geom_smooth(data = mic.df, aes(ID*10, Q025), 
+                    col = "grey", 
+                    method = "loess",
+                    span = 0.25,
+                    se = FALSE,
+                    linetype= "dashed") +
+        geom_smooth(data = mic.df, aes(ID*10, Q975), 
+                    col = "grey", 
+                    method = "loess",
+                    span = 0.25,
+                    se = FALSE,
+                    linetype= "dashed") +
+        geom_hline(yintercept = 0, 
+                   linetype = "dotted",
+                   col = "red",
+                   size = 1) +  
+        geom_vline(xintercept = 0, 
+                   linetype = "dotted",
+                   col = "red",
+                   size = 1) +
+        xlab(expression("Limiting Temperature  ("*~degree*C*"  )")) +
+        ylab("Logit") +  
+        theme_classic() +
+        theme(axis.text=element_text(size=16),
+              axis.title.y = element_text(size = 20),
+              axis.title.x = element_text(size = 20, vjust=-2))
+```
+
+###Find Limiting Temperture    
+Point at which logit becomes positive.    
+```{r}
+FindZero = function(X.df) {
+
+      Cross = which(diff(sign(X.df$Mean))!=0)
+
+      mTemp = (X.df$ID[Cross] + X.df$ID[Cross+1])/2
+
+      return(mTemp)      
+}
+
+###Temperature Limit (degrees C) #3.85
+FindZero(mic.df)[2]*10
+
+```
+
+###Fine-scale Spatial Structure     
+Accounting for the observed clustering pattern (possible related to dispersal ability).    
+```{r}
+mic.df = as.data.frame(Model5$summary.random$NN[,1:6])
+names(mic.df) = c("ID", "Mean", "sd", "Q025", "Q50", "Q975")
+
+Full.p = ggplot(mic.df, aes(ID*1000, Mean)) +
+        geom_smooth(method = "loess",
+                    se = FALSE, col = "black", 
+                    linetype= "solid") +
+        geom_smooth(data = mic.df, aes(ID*1000, Q025), 
+                    method = "loess",
+                    se = FALSE, col = "grey", 
+                    linetype= "dashed") +
+        geom_smooth(data = mic.df, aes(ID*1000, Q975), 
+                    method = "loess",
+                    se = FALSE, col = "grey", 
+                    linetype= "dashed") +
+        geom_hline(yintercept = 0, 
+                   linetype = "dotted",
+                   col = "red",
+                   size = 1) + 
+        geom_vline(xintercept = 0, 
+                   linetype = "dotted",
+                   col = "red",
+                   size = 1) +
+        xlim(c(0,28000)) +
+        xlab(NULL) +
+        ylab("Logit") +
+        ggtitle("A") +
+        theme_classic() +
+        theme(axis.text=element_text(size=16),
+              axis.title.y = element_text(size = 20),
+              axis.title.x = element_text(size = 20, vjust=-2),
+              plot.title = element_text(hjust = 0.5))
+
+
+
+###Zoom in some
+mic.df = as.data.frame(Model5$summary.random$NN[,1:6])
+names(mic.df) = c("ID", "Mean", "sd", "Q025", "Q50", "Q975")
+
+mic.df = mic.df %>%
+          filter(ID <= 2)
+
+Zoom.p = ggplot(mic.df, aes(ID*1000, Mean)) +
+        geom_smooth(method = "loess",
+                    se = FALSE, col = "black", 
+                    linetype= "solid") +
+        geom_smooth(data = mic.df, aes(ID*1000, Q025), 
+                    method = "loess",
+                    se = FALSE, col = "grey", 
+                    linetype= "dashed") +
+        geom_smooth(data = mic.df, aes(ID*1000, Q975), 
+                    method = "loess",
+                    se = FALSE, col = "grey", 
+                    linetype= "dashed") +
+        geom_hline(yintercept = 0, 
+                   linetype = "dotted",
+                   col = "red",
+                   size = 1) + 
+        geom_vline(xintercept = 0, 
+                   linetype = "dotted",
+                   col = "red",
+                   size = 1) +
+        xlim(c(0,2000)) +
+        xlab("Distance to Nearest Neighbor (km)") +
+        ylab("Logit") +  
+        ggtitle("B") +
+        theme_classic() +
+        theme(axis.text=element_text(size=16),
+              axis.title.y = element_text(size = 20),
+              axis.title.x = element_text(size = 20, vjust=-2),
+              plot.title = element_text(hjust = 0.5))
+
+
+grid.arrange(Full.p, Zoom.p, ncol=1)
+```
+
+###Threshold Distance
+```{r}
+###Max Distance for dispersal #1585
+FindZero(mic.df)[1]*1000
+```
+
